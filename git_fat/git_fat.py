@@ -214,6 +214,44 @@ class GitFat(object):
 
         return remote
 
+    def _s3_opts(self):
+        '''
+        Read http options from config
+        '''
+        if not os.path.isfile(self.cfgpath):
+            error('ERROR: git-fat requires that .gitfat is present to use s3 remotes')
+            sys.exit(1)
+
+        key = gitconfig_get('s3.key', file=self.cfgpath)
+        if not key:
+            error('ERROR: No s3.key in {0}'.format(self.cfgpath))
+            sys.exit(1)
+
+        secret = gitconfig_get('s3.secret', file=self.cfgpath)
+        if not secret:
+            error('ERROR: No s3.secret in {0}'.format(self.cfgpath))
+            sys.exit(1)
+
+        bucket = gitconfig_get('s3.bucket', file=self.cfgpath)
+        if not bucket:
+            error('ERROR: No s3.bucket in {0}'.format(self.cfgpath))
+            sys.exit(1)
+
+        extra = {}
+
+        # https://github.com/boto/boto/issues/621
+        host = gitconfig_get('s3.host', file=self.cfgpath)
+
+        if host:
+            extra['host'] = host
+
+        public = gitconfig_get('s3.public', file=self.cfgpath)
+
+        if public:
+            extra['public'] = public
+
+        return key, secret, bucket, extra
+
     def _rsync(self, push):
         '''
         Construct the rsync command
@@ -676,6 +714,39 @@ class GitFat(object):
             for g in stale:
                 print('\t' + g)
 
+    def _verify_and_store_orphan_stream(self, orphan_digest, stream):
+        '''
+        Downloads `stream`, verifys it's contents match the given
+        `orphan_digest` and puts it into the object store.
+        '''
+        blockiter = readblocks(stream)
+
+        # HTTP Error
+        if blockiter is None:
+            raise ValueError("failed to get iterator for stream")
+
+        fd, tmpname = tempfile.mkstemp(dir=self.objdir)
+        tmpstream = os.fdopen(fd, 'w')
+
+        # Hash the input, write to temp file
+        digest, size = self._hash_stream(blockiter, tmpstream)
+        tmpstream.close()
+
+        if digest != orphan_digest:
+            # Should I retry?
+            errmsg = (
+                'ERROR: Downloaded digest ({0}) did not match '
+                'stored digest for orphan: {1}').format(digest, orphan_digest)
+            error(errmsg)
+            os.remove(tmpname)
+
+            raise ValueError(errmsg)
+
+        objfile = os.path.join(self.objdir, digest)
+        os.chmod(tmpname, int('444', 8) & ~umask())
+        # Rename temp file
+        os.rename(tmpname, objfile)
+
     def http_pull(self, **kwargs):
         '''
         Alternative to rsync (for anon clones)
@@ -686,31 +757,12 @@ class GitFat(object):
         baseurl = self._http_opts()
         for o in orphans:
             stream = http_get(baseurl, o)
-            blockiter = readblocks(stream)
 
-            # HTTP Error
-            if blockiter is None:
+            try:
+                self._verify_and_store_orphan_stream(o, stream)
+            except ValueError:
                 ret_code = 1
-                continue
-
-            fd, tmpname = tempfile.mkstemp(dir=self.objdir)
-            tmpstream = os.fdopen(fd, 'w')
-
-            # Hash the input, write to temp file
-            digest, size = self._hash_stream(blockiter, tmpstream)
-            tmpstream.close()
-
-            if digest != o:
-                # Should I retry?
-                error('ERROR: Downloaded digest ({0}) did not match stored digest for orphan: {1}'.format(digest, o))
-                os.remove(tmpname)
-                ret_code = 1
-                continue
-
-            objfile = os.path.join(self.objdir, digest)
-            os.chmod(tmpname, int('444', 8) & ~umask())
-            # Rename temp file
-            os.rename(tmpname, objfile)
+                break
 
         self.checkout()
         sys.exit(ret_code)
@@ -718,6 +770,111 @@ class GitFat(object):
     def http_push(self):
         ''' NOT IMPLEMENTED '''
         pass
+
+    def _s3_get_bucket(self):
+        access_key_id, secret_access_key, bucket, extra = self._s3_opts()
+
+        try:
+            import boto
+        except ImportError:
+            error("ERROR: failed to import boto, please pip install boto")
+            raise
+
+        conn = boto.connect_s3(
+            access_key_id, secret_access_key, host=extra.get('host')
+        )
+
+        return conn.get_bucket(bucket)
+
+    def s3_pull(self, **kwargs):
+        bucket = self._s3_get_bucket()
+        _, orphans = self._status(**kwargs)
+        ret_code = 0
+
+        for o in orphans:
+            orphan_key = bucket.get_key(o)
+
+            try:
+                self._verify_and_store_orphan_stream(o, orphan_key)
+            except ValueError:
+                ret_code = 1
+                break
+
+        self.checkout()
+        sys.exit(ret_code)
+
+    def s3_make_all_private(self, **kwargs):
+        bucket = self._s3_get_bucket()
+        num_keys = 0
+
+        for key in bucket.get_all_keys():
+            # https://gist.github.com/lightpriest/4971525
+            acl = key.get_acl()
+
+            original = acl.acl.grants
+
+            acl.acl.grants = filter(
+                lambda g: g.uri != "http://acs.amazonaws.com/groups/global/AllUsers",
+                acl.acl.grants
+            )
+
+            if len(original) != len(acl.acl.grants):
+                key.set_acl(acl)
+                num_keys += 1
+
+        print('made {0} keys private'.format(num_keys))
+
+    def s3_make_all_public(self, **kwargs):
+        bucket = self._s3_get_bucket()
+
+        for key in bucket.get_all_keys():
+            key.make_public()
+
+        print('made all keys in bucket public')
+
+    def s3_push(self, **kwargs):
+        '''
+        Push all files which have changed.
+        '''
+        _, _, _, extra = self._s3_opts()
+
+        public_files = extra.get('public', '').lower().startswith('t')
+
+        def has_changed(localfile, key):
+            h = hashlib.md5()
+            for b in open(localfile):
+                h.update(b)
+            return key.etag[1:-1] != h.hexdigest()
+
+        # contains a list of paths to files managed by fat
+        files = self._referenced_objects(**kwargs) & self._cached_objects()
+
+        if not files:
+            print('no files to push')
+            sys.exit(0)
+
+        bucket = self._s3_get_bucket()
+
+        for filename in files:
+            filepath = self.objdir + '/' + filename
+
+            upload_key = False
+            key = bucket.get_key(filename)
+
+            if key is None:
+                key = bucket.new_key(filename)
+                upload_key = True
+
+            if not upload_key and has_changed(filepath, key):
+                upload_key = True
+
+            if upload_key:
+                key.set_contents_from_filename(filepath)
+
+                if public_files:
+                    key.make_public()
+
+                self.verbose('uploaded {0}'.format(key.name))
 
 
 def main():
@@ -791,6 +948,22 @@ def main():
     parser_list = subparser.add_parser('pull-http',
         help='anonymously download git-fat files over http')
     parser_list.set_defaults(func=fat.http_pull)
+
+    parser_list = subparser.add_parser('s3-pull',
+        help='download git-fat files using s3')
+    parser_list.set_defaults(func=fat.s3_pull)
+
+    parser_list = subparser.add_parser('s3-push',
+        help='push cache to amazon s3 remote')
+    parser_list.set_defaults(func=fat.s3_push)
+
+    parser_list = subparser.add_parser('s3-all-public',
+        help='make all keys in configured bucket public')
+    parser_list.set_defaults(func=fat.s3_make_all_public)
+
+    parser_list = subparser.add_parser('s3-all-private',
+        help='make all keys in configured bucket private')
+    parser_list.set_defaults(func=fat.s3_make_all_private)
 
     parser_index_filter = subparser.add_parser('index-filter',
         help='git fat index-filter for filter-branch')

@@ -23,6 +23,7 @@ Features
 -  Only depends on Python 2.7, rsync and ssh
 -  Download only the files you need with pattern matching
 -  Supports anonymous downloads of files over http
+-  Supports amazon s3 using boto
 
 Installation
 ------------
@@ -39,6 +40,14 @@ Or you can install it simply by placing it on your path.
 
     curl https://raw.github.com/cyaninc/git-fat/master/git_fat/git_fat.py \
     | sudo tee /usr/local/bin/git-fat && sudo chmod +x /usr/local/bin/git-fat
+
+
+If you want to use the S3 integration, you need to install the 
+`boto library <http://www.github.com/boto/boto>`
+
+::
+
+    pip install boto
 
 Usage
 -----
@@ -69,8 +78,6 @@ optionally include an http remote for anonymous clones.
     port = 2222
     [http]
     remote = http://storage.example.com/store
-
-Commit those files so that others will be able to use them.
 
 Initalize the repository. This adds a line to ``.git/config`` telling
 git what command to run for the ``fat`` filter is in the
@@ -126,6 +133,31 @@ all objects greater than 10MB in git's database and prints them out.
 ::
 
     git fat find 10485760
+
+S3 Backend usage
+----------------
+To use the S3 backend to store objects, you need to install boto as described
+above, configure gitfat to use s3.
+
+::
+    
+    [s3]
+    key=access_key_id
+    secret=secret_access_key
+    bucket=bucket_name
+    
+And use the commands ``s3-pull`` and ``s3-push``.
+
+If you experience ``Broken pipe`` errors from boto, you can configure a
+``host`` parameter in the ``[s3]`` section.
+
+If you want all keys to be made public as to use anonymous http access, you can
+enable the parameter ``public`` in the ``[s3]`` section by setting it to
+``true``.
+
+The methods ``s3-all-private`` and ``s3-all-public`` are available to aid the
+transition from private to public and vice versa.
+
 
 Implementation notes
 --------------------
