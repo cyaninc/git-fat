@@ -72,6 +72,7 @@ def get_log_level(log_level_string):
 
 GIT_FAT_LOG_LEVEL = get_log_level(os.getenv("GIT_FAT_LOG_LEVEL", ""))
 GIT_FAT_LOG_FILE = os.getenv("GIT_FAT_LOG_FILE", "")
+GIT_SSH = os.getenv("GIT_SSH")
 
 
 def git(cliargs, *args, **kwargs):
@@ -371,7 +372,9 @@ class RSyncBackend(BackendInterface):
 
         # extra must be passed in as single argv, which is why it's
         # not in the template and split isn't called on it
-        if platform.system() == "Windows":
+        if GIT_SSH:
+            extra = '--rsh={}'.format(GIT_SSH)
+        elif platform.system() == "Windows":
             extra = '--rsh=git-fat_ssh.exe'
         else:
             extra = '--rsh=ssh'
@@ -855,7 +858,7 @@ class GitFat(object):
         # TODO: Why use _orphan _and_ _referenced here?
         if pattern:
             # filter the working tree by a pattern
-            files = set(digest for digest, fname in self._orphan_files(patterns=(pattern,))) - cached_objs
+            files = set(digest for digest, fname in self._orphan_files(patterns=pattern)) - cached_objs
         else:
             # default pull any object referenced but not stored
             files = self._referenced_objects(**kwargs) - cached_objs
@@ -1015,6 +1018,7 @@ def main():
 
     sp = subparser.add_parser('pull', help='pull fatfiles from remote git-fat server')
     sp.add_argument("backend", nargs="?", help='pull using given backend')
+    sp.add_argument("pattern", nargs="*", help='files or file patterns to pull')
     sp.set_defaults(func='pull')
 
     sp = subparser.add_parser('checkout', help='resmudge all orphan objects')
@@ -1062,6 +1066,10 @@ def main():
         backend_opt = kwargs.pop('backend', None)
         config_file = kwargs.pop('config_file', None)
         backend = None
+        if kwargs['func'] == 'pull':
+            if backend_opt and backend_opt not in BACKEND_MAP:
+                kwargs['pattern'].insert(0, backend_opt)
+                backend_opt = None
         if kwargs['func'] in require_backend:
             backend = _parse_config(backend=backend_opt, cfg_file_path=config_file)
         run(backend, **kwargs)
