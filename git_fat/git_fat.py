@@ -72,6 +72,7 @@ def get_log_level(log_level_string):
 
 GIT_FAT_LOG_LEVEL = get_log_level(os.getenv("GIT_FAT_LOG_LEVEL", ""))
 GIT_FAT_LOG_FILE = os.getenv("GIT_FAT_LOG_FILE", "")
+GIT_SSH = os.getenv("GIT_SSH")
 
 
 def git(cliargs, *args, **kwargs):
@@ -371,7 +372,9 @@ class RSyncBackend(BackendInterface):
 
         # extra must be passed in as single argv, which is why it's
         # not in the template and split isn't called on it
-        if platform.system() == "Windows":
+        if GIT_SSH:
+            extra = '--rsh={}'.format(GIT_SSH)
+        elif platform.system() == "Windows":
             extra = '--rsh=git-fat_ssh.exe'
         else:
             extra = '--rsh=ssh'
