@@ -10,6 +10,12 @@ import stat
 import platform
 import re
 
+#Import GitFatConfig for unit-testing it
+sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from git_fat.git_fat import GitFatConfig
+#Needed to undo the patching of suprocess.check_output in git_fat.py
+reload(sub)
+
 _logging.basicConfig(format='%(levelname)s:%(filename)s: %(message)s')
 logger = _logging.getLogger(__name__)
 
@@ -514,6 +520,43 @@ class GeneralTestCase(InitRepoTestCase):
         self.assertTrue(flowerpot in read_index('.gitattributes'))
 
         delete_file(filename)
+
+class ConfigTestCase(Base):
+    def setUp(self):
+        super(ConfigTestCase, self).setUp()
+        with open('.gitfat', 'wb') as f:
+            f.write('[section1]\nkey1={section2.key1}\n[defaults "section2"]\nkey1=s2k1def')
+
+    def test_defaults(self):
+        files = ['siteconfig']
+        with open(files[0], 'wb') as f:
+            f.write('[section2]\nkey1=s2k1')
+        config = GitFatConfig(parse_git=False, parse_local=True)
+        self.assertEqual(config.get('section1.key1'), 's2k1def')
+        config2 = GitFatConfig(files, parse_git=False, parse_local=True)
+        self.assertEqual(config2.get('section1.key1'), 's2k1')
+
+    def test_missing_ref(self):
+        files = ['siteconfig']
+        with open(files[0], 'wb') as f:
+            f.write('[section2]\nkey1={section3.key1}')
+        config = GitFatConfig(files, parse_git=False, parse_local=True)
+        self.assertRaisesRegexp(RuntimeError, r'^Could not interpolate', config.get, 'section1.key1')
+
+    def test_missing_key(self):
+        config = GitFatConfig(parse_git=False, parse_local=True)
+        self.assertIsNone(config.get('section3.key1'))
+
+    def test_cirular_ref(self):
+        files =  ['file1', 'file2', 'file3']
+        with open(files[0], 'wb') as f:
+            f.write('[section1]\nkey1={section2.key1}')
+        with open(files[1], 'wb') as f:
+            f.write('[section2]\nkey1={section3.key1}')
+        with open(files[2], 'wb') as f:
+            f.write('[section3]\nkey1={section1.key1}')
+        config = GitFatConfig(files, parse_git=False, parse_local=False)
+        self.assertRaisesRegexp(RuntimeError, r'^Circular reference detected', config.get, 'section1.key1')
 
 
 if __name__ == "__main__":
