@@ -81,10 +81,11 @@ See also other scripts in the win32/ directory:
 
 Configuration
 -------------
-``git-fat`` is configured by defining in the ``.gitattributes``
-file at the root the repository which files it should manage and by
-providing git-fat-specific configuration settings, typically  in a
-``.gitfat`` file also at the root of the repository.
+``git-fat`` is configured through ``filter`` attributes in  the  regular
+``gitattributes`` files (see ``git help gitattributes``)  and through
+``git-fat``-specific configuration settings typically  in a ``.gitfat`` file
+at the root of the repository. The details and examples of these can be
+found below.
 
 Note that version 0.4.0 of ``git-fat`` introduces new optional constructs
 in the configuration domain without sacrificing support for the configuration
@@ -157,7 +158,7 @@ for further information.
 ::
 
     cat >> .gitattributes <<EOF
-    *.deb filter=kat -crlf
+    *.deb filter=fat -crlf
     *.gz filter=fat -crlf
     *.zip filter=fat -crlf
     EOF
