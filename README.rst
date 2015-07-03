@@ -81,10 +81,10 @@ See also other scripts in the win32/ directory:
 
 Configuration
 -------------
-``git-fat`` is configured through ``filter`` attributes in  the  regular
-``gitattributes`` files (see ``git help gitattributes``)  and through
-``git-fat``-specific configuration settings typically  in a ``.gitfat`` file
-at the root of the repository. The details and examples of these can be
+``git-fat`` is configured through ``filter`` attributes in regular
+``.gitattributes`` files (see ``git help gitattributes``)  and through
+git-fat-specific configuration settings, typically  in a ``.gitfat`` file
+at the root of the repository. More details and examples of these can be
 found below.
 
 Note that version 0.4.0 of ``git-fat`` introduces new optional constructs
@@ -141,8 +141,8 @@ in the *main configuration file* (and only there).
     key1 = default-value-1
 
 When placed in the *main configurtion file*, the section above means that if -and only if- a
-setting with *setting name* ``original-section.key`` has not been defined in any configuration
-file, the interpolation of the string ``{original-section.key}`` will yield ``default-value-1``,
+setting with *setting name* ``original-section.key1`` has not been defined in any configuration
+file, the interpolation of the string ``{original-section.key1}`` will yield ``default-value-1``,
 otherwise it will yield the value it was given in the configuration file where it was defined.
 
 Example files
@@ -150,10 +150,10 @@ Example files
 
 ``.gitattributes``
 '''''''''''''''''''
-This file is located at the root of the repository and determines which files
-get converted to ``git-fat`` files. See
+``git-fat`` manages only those files for which the attribute ``filter=fat`` has been specified
+in a ``.gitattributes`` file. See ``git help gitattributes`` or have a look at
 `git attributes <http://git-scm.com/book/en/Customizing-Git-Git-Attributes>`_
-for further information.
+for general information on the ``.gitattributes`` files.
 
 ::
 
@@ -162,6 +162,9 @@ for further information.
     *.gz filter=fat -crlf
     *.zip filter=fat -crlf
     EOF
+
+If placed at the root of the repository, the file above would instruct ``git-fat``
+to handle all ``*.deb``, ``*.gz`` and ``*.zip`` files inside the repository.
 
 ``.gitfat`` (legacy)
 ''''''''''''''''''''''''
@@ -287,7 +290,7 @@ they try to pull fat-files.
 
 After we've done a new clone of a repository using ``git-fat``, to get
 the additional files we do a fat pull.  This will pull the default backend
-which can be explicitely mentioned as in the namespaced ``.gitfat`` example
+which can be explicitly mentioned as in the namespaced ``.gitfat`` example
 above, or else is determined by the first entry in the *main configuration
 file*, as in the legacy ``.gitfat`` example above.
 
