@@ -10,10 +10,10 @@ import stat
 import platform
 import re
 
-#Import GitFatConfig for unit-testing it
+# Import GitFatConfig for unit-testing it
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from git_fat.git_fat import GitFatConfig
-#Needed to undo the patching of suprocess.check_output in git_fat.py
+# Needed to undo the patching of suprocess.check_output in git_fat.py
 reload(sub)
 
 _logging.basicConfig(format='%(levelname)s:%(filename)s: %(message)s')
@@ -521,7 +521,9 @@ class GeneralTestCase(InitRepoTestCase):
 
         delete_file(filename)
 
+
 class ConfigTestCase(Base):
+
     def setUp(self):
         super(ConfigTestCase, self).setUp()
         with open('.gitfat', 'wb') as f:
@@ -548,7 +550,7 @@ class ConfigTestCase(Base):
         self.assertIsNone(config.get('section3.key1'))
 
     def test_cirular_ref(self):
-        files =  ['file1', 'file2', 'file3']
+        files = ['file1', 'file2', 'file3']
         with open(files[0], 'wb') as f:
             f.write('[section1]\nkey1={section2.key1}')
         with open(files[1], 'wb') as f:
