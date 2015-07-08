@@ -9,12 +9,13 @@ import subprocess as sub
 import sys
 import tempfile
 import warnings
-import ConfigParser as cfgparser
 import logging as _logging  # Use logger.error(), not logging.error()
 import shutil
 import argparse
 import platform
 import stat
+import string
+import re
 
 _logging.basicConfig(format='%(levelname)s:%(filename)s: %(message)s')
 logger = _logging.getLogger(__name__)
@@ -47,7 +48,7 @@ except ImportError:
 
     sub.check_output = backport_check_output
 
-__version__ = '0.3.4'
+__version__ = '0.4.1'
 
 BLOCK_SIZE = 4096
 
@@ -182,27 +183,6 @@ def cat_iter(initer, outstream):
 
 def cat(instream, outstream):
     return cat_iter(readblocks(instream), outstream)
-
-
-def gitconfig_get(name, cfgfile=None):
-    args = ['config', '--get']
-    if cfgfile is not None:
-        args += ['--file', cfgfile]
-    args.append(name)
-    p = git(args, stdout=sub.PIPE)
-    output = p.communicate()[0].strip()
-    if p.returncode != 0:
-        return ''
-    else:
-        return output
-
-
-def gitconfig_set(name, value, cfgfile=None):
-    args = ['git', 'config']
-    if cfgfile is not None:
-        args += ['--file', cfgfile]
-    args += [name, value]
-    sub.check_call(args)
 
 
 def _config_path(path=None):
@@ -425,16 +405,14 @@ class RSyncBackend(BackendInterface):
             raise OSError('Error running "%s"' % " ".join(rsync))
 
         p.communicate(input='\x00'.join(file_list))
-        # TODO: fix for success check
-        return True
+        return p.returncode == 0
 
     def push_files(self, file_list):
         rsync = self._rsync(push=True)
         logger.debug("rsync push command: {}".format(" ".join(rsync)))
         p = sub.Popen(rsync, stdin=sub.PIPE)
         p.communicate(input='\x00'.join(file_list))
-        # TODO: fix for success check
-        return True
+        return p.returncode == 0
 
 
 BACKEND_MAP = {
@@ -446,10 +424,11 @@ BACKEND_MAP = {
 
 class GitFat(object):
 
-    def __init__(self, backend, full_history=False):
+    def __init__(self, backend, config, full_history=False):
 
         # The backend instance we use to get the files
         self.backend = backend
+        self.config = config
         self.full_history = full_history
         self.rev = None  # Unused
         self.objdir = _obj_dir()
@@ -472,8 +451,8 @@ class GitFat(object):
         '''
         if not self._configured():
             print('Setting filters in .git/config')
-            gitconfig_set('filter.fat.clean', 'git-fat filter-clean %f')
-            gitconfig_set('filter.fat.smudge', 'git-fat filter-smudge %f')
+            self.config.set('filter.fat.clean', 'git-fat filter-clean %f', update_gitconfig=True)
+            self.config.set('filter.fat.smudge', 'git-fat filter-smudge %f', update_gitconfig=True)
             print('Creating .git/fat/objects')
             mkdir_p(self.objdir)
             print('Initialized git-fat')
@@ -483,7 +462,7 @@ class GitFat(object):
         Returns true if git-fat is already configured
         '''
         reqs = os.path.isdir(self.objdir)
-        filters = gitconfig_get('filter.fat.clean') and gitconfig_get('filter.fat.smudge')
+        filters = self.config.get('filter.fat.clean') and self.config.get('filter.fat.smudge')
         return filters and reqs
 
     def _encode(self, digest, size):
@@ -926,7 +905,7 @@ class GitFat(object):
                      .format(patterns, kwargs, len(files)))
 
         if not self.backend.pull_files(files):
-            sys.exit(1)
+            raise RuntimeError("Pull operation terminated abnormally")
         # Make sure they're up to date
         if kwargs.pop("many_binaries", False):
             print('in accelerating mode')
@@ -942,7 +921,7 @@ class GitFat(object):
         logger.debug("PUSH: unused_pattern={}, kwargs={}, len(files)={}"
                      .format(unused_pattern, kwargs, len(files)))
         if not self.backend.push_files(files):
-            sys.exit(1)
+            raise RuntimeError("Push operation terminated abnormally")
 
     def _status(self, **kwargs):
         '''
@@ -969,44 +948,22 @@ class GitFat(object):
                 print('\t' + g)
 
 
-def _get_options(config, backend, cfg_file_path):
-    """ returns the options for a backend in dictionary form """
-    try:
-        opts = dict(config.items(backend))
-    except cfgparser.NoSectionError:
-        err = "No section found in {} for backend {}".format(cfg_file_path, backend)
-        raise RuntimeError(err)
-    return opts
-
-
-def _read_config(cfg_file_path=None):
-    config = cfgparser.SafeConfigParser()
-    if not os.path.exists(cfg_file_path):
-        # Can't continue, but this isn't unusual
-        logger.warning("This does not appear to be a repository managed by git-fat. "
-                       "Missing configfile at: {}".format(cfg_file_path))
-        sys.exit(0)
-    try:
-        config.read(cfg_file_path)
-    except cfgparser.Error:  # TODO: figure out what to catch here
-        raise RuntimeError("Error reading or parsing configfile: {}".format(cfg_file_path))
-    return config
-
-
-def _parse_config(backend=None, cfg_file_path=None):
-    """ Parse the given config file and return the backend instance """
-    cfg_file_path = _config_path(path=cfg_file_path)
-    config = _read_config(cfg_file_path)
+def _get_backend(config, backend=None):
+    """Return the backend instance """
     if backend is None:
-        try:
-            backends = config.sections()
-        except cfgparser.Error:
-            raise RuntimeError("Error reading or parsing configfile: {}".format(cfg_file_path))
-        if not backends:  # e.g. empty file
-            raise RuntimeError("No backends configured in config: {}".format(cfg_file_path))
-        backend = backends[0]
-
-    opts = _get_options(config, backend, cfg_file_path)
+        backend = config.get('gitfat.backend') or config.get('gitfat.runtime.firstsection')
+        if backend is None:
+            if config.get('gitfat.runtime.parsed-git-config') and len(config.get('gitfat.runtime.parsed-files')) == 1:
+                # To keep the original behaviour, just exit with status code when no .gitfat file was parsed
+                logger.warning("This does not appear to be a repository managed by git-fat. ")
+                sys.exit(0)
+            else:
+                raise RuntimeError("No backends configured in  {}".
+                                   format(config.get('gitfat.runtime.parsed-files')[-1]))
+    opts = config.get('gitfat.' + backend) or config.get(backend)
+    if opts is None:
+        raise RuntimeError("Could not find section gitfat.{} or {} in configuration data from {}".
+                           format(backend, backend, config.get('gitfat.runtime.parsed-files')))
     base_dir = _obj_dir()
 
     try:
@@ -1016,18 +973,25 @@ def _parse_config(backend=None, cfg_file_path=None):
     return Backend(base_dir, **opts)
 
 
-def run(backend, **kwargs):
+def run(backend, config, **kwargs):
     make_sys_streams_binary()
     name = kwargs.pop('func')
     full_history = kwargs.pop('full_history')
-    gitfat = GitFat(backend, full_history=full_history)
+    gitfat = GitFat(backend, config, full_history=full_history)
     fn = name.replace("-", "_")
     if not hasattr(gitfat, fn):
         raise Exception("Unknown function called")
     getattr(gitfat, fn)(**kwargs)
 
 
-def _configure_logging(log_level):
+def _configure_logging(kwargs):
+    # Popping both 'debug' and 'verbose' independently of each other in case
+    # both are passed on the invocation
+    log_level = _logging.WARNING
+    if kwargs.pop('verbose', None):
+        log_level = _logging.INFO
+    if kwargs.pop('debug', None):
+        log_level = _logging.DEBUG
     if GIT_FAT_LOG_LEVEL:
         log_level = GIT_FAT_LOG_LEVEL
     if GIT_FAT_LOG_FILE:
@@ -1040,10 +1004,178 @@ def _configure_logging(log_level):
     logger.setLevel(log_level)
 
 
-def _load_backend(kwargs):
+class ConfigFormatter(string.Formatter):
+    """Allows object notation when interpolating against the config dict"""
+    def __init__(self):
+        super(ConfigFormatter, self).__init__()
+        self._visited_keys = []
+
+    def get_field(self, field_name, args, kwargs):
+        """Allows object notation against dict, and keeps track of visited keys"""
+        if field_name in self._visited_keys:
+            raise RuntimeError("Circular reference detected, where the following keys are involved: {}".
+                               format(self._visited_keys))
+        else:
+            self._visited_keys.append(field_name)
+        fields = field_name.split('.')
+        obj = self.get_value(fields[0], args, kwargs)
+        for field in fields[1:]:
+            obj = obj[field]
+        return obj, fields[0]
+
+    def vformat_ncr(self, format_string, visited_keys, args, kwargs):
+        """Just a wrapper to the standard vformat with an extra param for keeping track of circular refrences"""
+        self._visited_keys = visited_keys
+        return super(ConfigFormatter, self).vformat(format_string, args, kwargs)
+
+
+class GitFatConfig(object):
+    """Configuration cache for storing all settings read with 'git config'"""
+
+    def __init__(self, files=None, parse_git=True, parse_local=True):
+        """Constructor for GitFatConfig objects. Arguments:
+               files: A list containing user-provided configuration files to load into the object's cache.
+               parse_git: When True the default Git configuration files will be loaded into the object's cache.
+               parse_local: When True, the .gitfat file at the root of the repo will be loaded into the
+               object's cache."""
+        # self._data is a dict used for storing the all configuration settings
+        # The 'gitfat.runtime' key is used for house-keeping of parsed files
+        self._data = {'gitfat': {'runtime': {'parsed-files': [], 'parsed-git-config': False}}}
+        # The config formatter is used to allow for object notation when interpolating
+        self._config_formatter = ConfigFormatter()
+
+        if files is None:
+            files = []
+
+        last = len(files) - 1
+        for index, path in enumerate([path for path in files if path]):
+            # The last user-provided file is the main config file if .gitfat is not being parsed
+            is_main = not parse_local and index < last
+            self._cache_file(path=path, is_main=is_main)
+        if parse_git:
+            self._cache_file()
+        if parse_local:
+            try:
+                git_toplevel = sub.check_output('git rev-parse --show-toplevel'.split()).strip()
+            except sub.CalledProcessError:
+                raise RuntimeError('git-fat must be run from a git directory')
+            local_gitfat_config = os.path.join(git_toplevel, '.gitfat')
+            if os.path.isfile(local_gitfat_config):
+                self._data['gitfat']['runtime']['localfile'] = local_gitfat_config
+                self._cache_file(path=local_gitfat_config, is_main=True)
+            else:
+                logger.warning("Missing configfile at: {}".format(local_gitfat_config))
+
+    def get(self, key=None, interpolate=True):
+        """Returns the configuration value associated to dot-separated key"""
+        elem = self._data
+        if not isinstance(key, basestring):
+            raise TypeError("Expected {} but got {}".format(basestring, type(key)))
+        elif key is not None:
+            for field in key.split('.'):
+                if field in elem:
+                    elem = elem[field]
+                else:
+                    elem = None
+                    break
+        if interpolate:
+            result = self._interpolate(elem)
+        else:
+            result = elem
+        logger.debug("config.get({}) = {}".format(key, result))
+        return result
+
+    def _interpolate(self, elem):
+        """Recurses through dicts and performs interpolation of string values against self._data at 'get' time"""
+        if isinstance(elem, basestring):
+            visited = []
+            result = elem
+            while True:
+                try:
+                    next_result = self._config_formatter.vformat_ncr(result, visited, None, self._data)
+                except KeyError as err:
+                    raise RuntimeError("Could not interpolate '{}' with data from {}.".
+                                       format(result, self._data['gitfat']['runtime']['parsed-files']))
+                except AttributeError as err:
+                    raise RuntimeError("Could not interpolate '{}' with data from {} due to '{}'.".
+                                       format(result, self._data['gitfat']['runtime']['parsed-files'], err))
+                if result == next_result:
+                    break
+                else:
+                    result = next_result
+            return result
+        elif isinstance(elem, dict):
+            result = {}
+            for key, value in elem.iteritems():
+                result[key] = self._interpolate(value)
+            return result
+        else:
+            return elem
+
+    def set(self, key, value=None, update_gitconfig=False, cfgfile=None):
+        """Sets the configuration value associated to a dot-separated key"""
+        elem = self._data
+        if not isinstance(key, basestring):
+            raise TypeError("Expected {} but got {}".format(basestring, type(key)))
+        fields = key.split('.')
+        for field in fields[:-1]:
+            if field not in elem:
+                elem[field] = {}
+            elem = elem[field]
+        elem[fields[-1]] = value
+        if update_gitconfig:
+            gitargs = ['git', 'config']
+            if cfgfile is not None:
+                gitargs += ['--file', cfgfile]
+            gitargs += [key, value]
+            sub.check_call(gitargs)
+
+    def _cache_file(self, path=None, is_main=False):
+        """Uses 'git config --get-regexp .' to read a configuration file and store the
+            configuration data in the config dict. Arguments:
+                path: The target file, if None it will read Git's own configuration files.
+                is_main: Flags the main file (typically .gitfat) so that backwards compatibility is
+                         preserved when it comes to assuming that the default backend is the first section
+                         of the main file."""
+        is_first = True
+        if path:
+            self._data['gitfat']['runtime']['parsed-files'].append(path)
+        else:
+            self._data['gitfat']['runtime']['parsed-files'].append('<git-config-files>')
+            self._data['gitfat']['runtime']['parsed-git-config'] = True
+        gitargs = ['config']
+        if path is not None:
+            gitargs += ['--file', path]
+        gitargs += ['--get-regexp', '.']
+        p = git(gitargs, stdout=sub.PIPE)
+        stdout = p.communicate()[0].strip()
+        if p.returncode == 0:
+            for line in stdout.splitlines():
+                key_value_list = line.split(None, 1)
+                if len(key_value_list) == 2:
+                    key, value = key_value_list
+                else:
+                    key = key_value_list[0]
+                    value = None
+                if is_main:
+                    fields = key.split('.', 1)
+                    # Defaults are only read from the main/last file and stored if they dont overwrite data
+                    if fields[0] == 'defaults' and self.get(fields[1], interpolate=False) is None:
+                        self.set(fields[1], value)
+                    else:
+                        self.set(key, value)
+                        if is_first:
+                            # The first non-defaults section is the default backend in legacy mode
+                            self._data['gitfat']['runtime']['firstsection'] = os.path.splitext(key)[0]
+                else:
+                    self.set(key, value)
+                # logger.debug('[config] {} = {}'.format(key, value))
+                is_first = False
+
+
+def _load_backend(config, kwargs):
     needs_backend = ('pull', 'push')
     backend_opt = kwargs.pop('backend', None)
-    config_file = kwargs.pop('config_file', None)
     backend = None
     if kwargs['func'] == 'pull':
         # since pull can be of the form pull [backend] [patterns], we need to check
@@ -1054,12 +1186,11 @@ def _load_backend(kwargs):
             kwargs['patterns'].insert(0, backend_opt)
             backend_opt = None
     if kwargs['func'] in needs_backend:
-        backend = _parse_config(backend=backend_opt, cfg_file_path=config_file)
+        backend = _get_backend(config, backend=backend_opt)
     return backend
 
 
 def main():
-
     parser = argparse.ArgumentParser(
         argument_default=argparse.SUPPRESS,
         description='A tool for managing large binary files in git repositories.')
@@ -1076,8 +1207,12 @@ def main():
         '-d', "--debug", dest='debug', action='store_true',
         help='Get debugging output about what git-fat is doing')
     parser.add_argument(
-        '-c', "--config", dest='config_file', type=str,
-        help='Specify which config file to use (defaults to .gitfat)')
+        '-c', "--config", dest='config_file_list', type=str, action='append', default=[],
+        help="Specify which config files to use. Can be used multiple times. "
+             "If not provided, git-fat will first load configuration data from the colon-searated "
+             "files in $GIT_FAT_CONFIG (if GIT_FAT_CONFIG is defined), then it will parse the standard "
+             "Git configuration files as in 'git config --get-regexp .' and finally it will parse the "
+             "'.gitconfig' file at the root of the repository")
 
     # redundant function for legacy api; config gets called every time.
     # (assuming if user is calling git-fat they want it configured)
@@ -1135,19 +1270,26 @@ def main():
     args = parser.parse_args()
     kwargs = dict(vars(args))
 
-    if kwargs.pop('debug', None):
-        log_level = _logging.DEBUG
-    elif kwargs.pop('verbose', None):
-        log_level = _logging.INFO
+    _configure_logging(kwargs)  # mutates kwargs
+
+    if kwargs.pop('config_file_list', []):
+        # Config files where passed, hence to Git or .gitfat configs are read
+        config = GitFatConfig(files=args.config_file_list, parse_git=False, parse_local=False)
     else:
-        log_level = _logging.WARNING
-    _configure_logging(log_level)
+        # No config files where passed, hence $GIT_FAT_CONFIG, the Git files and .gitfat are read
+        config = GitFatConfig(os.getenv('GIT_FAT_CONFIG', '').split(':'), parse_git=True, parse_local=True)
 
     try:
-        backend = _load_backend(kwargs)  # load_backend mutates kwargs
-        run(backend, **kwargs)
+        backend = _load_backend(config, kwargs)  # load_backend mutates kwargs
+        run(backend, config, **kwargs)
     except RuntimeError as err:
         logger.error(str(err))
+        try:
+            message = re.sub(r'\s+', ' ', config.get('gitfat.canned-error-message'))
+        except TypeError:
+            pass
+        else:
+            print('\n' + message, file=sys.stderr)
         sys.exit(1)
     except:
         if kwargs.get('cur_file'):
@@ -1158,4 +1300,4 @@ def main():
 if __name__ == '__main__':
     main()
 
-__all__ = ['__version__', 'main', 'GitFat']
+__all__ = ['__version__', 'main', 'GitFat', 'GitFatConfig']

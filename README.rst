@@ -79,13 +79,81 @@ See also other scripts in the win32/ directory:
 -  setup_wheel.bat - create a binary Python Wheel package in the dist/
    directory and install that package
 
-Usage
------
+Configuration
+-------------
+``git-fat`` is configured through ``filter`` attributes in regular
+``.gitattributes`` files (see ``git help gitattributes``)  and through
+git-fat-specific configuration settings, typically  in a ``.gitfat`` file
+at the root of the repository. More details and examples of these can be
+found below.
 
-First, create a
+Note that version 0.4.0 of ``git-fat`` introduces new optional constructs
+in the configuration domain without sacrificing support for the configuration
+syntax used in previous versions (called legacy configuration files
+below).
+
+Modes of operation
+~~~~~~~~~~~~~~~~~~
+
+When it comes to the git-fat-specific configuration settings, there is
+two modes of operation.
+
+Implicit configuration (default)
+''''''''''''''''''''''''''''''''
+
+When no configuration files are passed as arguments to the ``-c`` option,
+``git-fat`` parses the following configuration files in the order they
+are listed here:
+
+1. If ``$GIT_FAT_CONFIG`` is defined and contains a colon-separated list of files,
+   ``git-fat`` parses those files, overriding previously defined settings with the
+   same name if they exist.
+2. The regular Git configuration files (see the ``FILES`` section of  ``man git-config``)
+   are parsed, overriding any previously defined configuration settings with the same name
+   if they exist.
+3. The ``.gitfat`` configuration file at the root of the repository is parsed,
+   overriding previously defined configuration settings with the same name if they exist.
+   In this case the ``.gitfat`` file is considered to be the *main configuration file*.
+
+Explicit configuration
+''''''''''''''''''''''
+
+When one or more configuration files are passed as arguments to the ``-c`` option,
+``git-fat`` processes each of those files in the order they were passed,
+overriding previously defined configuration settings with the same name if they exist.
+
+In this case, the last one of the files is considered to be the *main configuration file*.
+
+Interpolation
+~~~~~~~~~~~~~
+
+``git-fat`` performs interpolation on the setting values that are used by ``git-fat`` itself.
+Interpolation consists on replacing *setting names* delimited by curly braces {} with the value
+of those settings. *Setting names* are dot-separated strings with the section, subsection (if
+applicable) and key names of settings defined in the parsed configuration files.
+
+For the sake of integrity, it is possible to specify default values for interpolation
+in the *main configuration file* (and only there).
+
+::
+
+    [defaults "original-section"]
+    key1 = default-value-1
+
+When placed in the *main configurtion file*, the section above means that if -and only if- a
+setting with *setting name* ``original-section.key1`` has not been defined in any configuration
+file, the interpolation of the string ``{original-section.key1}`` will yield ``default-value-1``,
+otherwise it will yield the value it was given in the configuration file where it was defined.
+
+Example files
+~~~~~~~~~~~~~~
+
+``.gitattributes``
+'''''''''''''''''''
+``git-fat`` manages only those files for which the attribute ``filter=fat`` has been specified
+in a ``.gitattributes`` file. See ``git help gitattributes`` or have a look at
 `git attributes <http://git-scm.com/book/en/Customizing-Git-Git-Attributes>`_
-file in the root of your repository. This file determines which files
-get converted to ``git-fat`` files.
+for general information on the ``.gitattributes`` files.
 
 ::
 
@@ -95,10 +163,14 @@ get converted to ``git-fat`` files.
     *.zip filter=fat -crlf
     EOF
 
-Next, create a ``.gitfat`` configuration file in the root of your repo
-that contains the location of the remote store for the binary files.
-Optionally include the ssh user and port if non-standard. Also,
-optionally include an http remote for anonymous clones.
+If placed at the root of the repository, the file above would instruct ``git-fat``
+to handle all ``*.deb``, ``*.gz`` and ``*.zip`` files inside the repository.
+
+``.gitfat`` (legacy)
+''''''''''''''''''''''''
+
+``.gitfat`` is typically located at root of the repository but could be
+explicitly passed as argument to the ``-c`` options (see *Modes of operation* above).
 
 ::
 
@@ -109,11 +181,98 @@ optionally include an http remote for anonymous clones.
     [http]
     remote = http://storage.example.com/store
 
-Commit those files so that others will be able to use them.
+In this case the first section of the file is treated as the default backend.
 
-Initialize the repository. This adds a line to ``.git/config`` telling
-git what command to run for the ``fat`` filter is in the
-``.gitattributes`` file.
+For legacy ``.gitfat`` files indentation is discouraged as it is not supported by
+previous versions of ``git-fat``.
+
+``.gitfat`` (namespaced)
+''''''''''''''''''''''''''''''''''''''
+
+::
+
+	[gitfat]
+		backend = rsync
+		canned-error-message = "A message to append on stderr on run-time errors"
+	[gitfat "rsync"]
+		remote = storage.example.com:/path/to/store
+		user = git
+		port = 2222
+	[gitfat "http"]
+		remote = http://storage.example.com/store
+
+In this case the default backend is explicitly mentioned.
+
+Note that indentation is possible, but it must be done with tabs.
+
+This syntax is not compatible with ``git-fat`` versions prior to 0.4.0.
+
+``.gitfat`` (interpolated)
+''''''''''''''''''''''''''''
+This example meant to be used in combination with *supporting
+configuration files* (see below) and makes uses of the interpolation
+mechanism described above.
+
+::
+
+	[gitfat]
+		canned-error-message = "A message to append on stderr on run-time errors"
+	[gitfat "rsync"]
+		remote = {siteconfig.synchost}:{siteconfig.syncroot}
+		user = git
+		port = 2222
+	[gitfat "http"]
+		remote = {siteconfig.http-url}
+	[defaults "gitfat"]
+		backend = rsync
+	[defaults "siteconfig"]
+		synchost = localhost
+		syncroot = /path/to/local/store/mount
+		http-url = http://storage.example.com/store
+
+Note that indentation is possible, but it must be done with tabs.
+
+This syntax is not compatible with ``git-fat`` versions prior to 0.4.0.
+
+*Supporting configuration file*
+'''''''''''''''''''''''''''''''
+*Supporting configuration files* are typically used to define settings that require
+site, repository or user variability.
+
+Examples of supporting configuration files are:
+
+* An arbitrary file path contained in ``$GIT_FAT_CONFIG``.
+* ``~/.gitconfig`` for user-specific settings.
+* ``.git/config`` at the root of a repository for local, repository-wide settings.
+* An arbitrary file path passed to ``git-fat`` as an argument to ``-c`` option not
+  being the last ``-c`` option in the invocation call.
+
+A configuration file thought to complement the interpolated ``.git-fat`` file above
+may look like the following:
+
+::
+
+	[gitfat]
+		backend = rsync
+	[siteconfig]
+		synchost = storage.example.com
+		syncroot = /path/to/store
+		http-url = http://storage.example.com/store
+
+This syntax is not compatible with ``git-fat`` versions prior to 0.4.0.
+
+Usage
+-----
+
+The commands described below require that the ``.gitattributes`` and
+the configuration files (typically just ``.gitfat``) have been set up
+as described in the *Configuration* section above.  Remember to commit
+the ``.gitfat`` and ``.gitattributes`` files so that others will be
+able to use them.
+
+The command below is used to initialize the repository. This adds a line to
+``.git/config`` telling git what command to run for the ``fat`` filter referred to in
+the ``.gitattributes`` file.
 
 ::
 
@@ -131,7 +290,9 @@ they try to pull fat-files.
 
 After we've done a new clone of a repository using ``git-fat``, to get
 the additional files we do a fat pull.  This will pull the default backend
-as determined by the first entry in the ``.gitfat`` file for the repo.
+which can be explicitly mentioned as in the namespaced ``.gitfat`` example
+above, or else is determined by the first entry in the *main configuration
+file*, as in the legacy ``.gitfat`` example above.
 
 ::
 
@@ -303,7 +464,6 @@ Improvements
 
 -  Better Documentation (esp. setting up a server)
 -  Improved Testing
--  config file location argument (global)
 -  cli option to specify which backend to use for push and pull (http, rsync, etc)
 -  Python 3 compatibility (without six)
 -  Really implement pattern matching
