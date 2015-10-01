@@ -371,11 +371,13 @@ class RSyncBackend(BackendInterface):
         self.ssh_port = ssh_port
         self.base_dir = base_dir
         # Swap Windows style drive letters (e.g. 't:') for cygwin style drive letters (e.g. '/t')
-        # Otherwise, when using an rsyncd remote (e.g. 'example.org::bin'),
-        # The rsync client on Windows will exit with this error:
+        # Otherwise, when using certain rsync remotes, the rsync client on Windows will exit with this error:
         # "The source and destination cannot both be remote."
-        # Presumably, this is because rsync assumes any path is remote if it contains a colon.
-        if platform.system() == 'Windows' and self.is_rsyncd_remote and self.base_dir.find(':') == 1:
+        # Presumably, this is because rsync assumes a path is remote if it contains a colon.
+        # Examples of bad double colon situations that can cause this:
+        # Local path is "c:/some/path" and remote is "example.org:/some/path" (ssh remote)
+        # Local path is "c:/some/path" and remote is "example.org::bin" (rsyncd remote)
+        if platform.system() == 'Windows' and self.base_dir.find(':') == 1:
             self.base_dir = "/" + self.base_dir[0] + self.base_dir[2:]
 
     def _rsync(self, push):
