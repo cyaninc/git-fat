@@ -109,6 +109,33 @@ optionally include an http remote for anonymous clones.
     [http]
     remote = http://storage.example.com/store
 
+Another available option than ``[rsync]`` is Amazon Web Services S3 storage ``[aws-s3]``.
+
+::
+
+    [aws-s3]
+    region_name = aws-s3-region
+    bucket = aws-s3-bucket-name
+    transfer_num_threads = number-of-threads-recommended-8
+
+    #aws_access_key_id = aws-access-key
+    #aws_secret_access_key = aws-secret-key
+    ## or
+    #credentials_file = path-to-ini-file-with-credentials
+    #credentials_file_section = ini-file-section-name
+    ##  If none of the above credentials methods are specified, the default
+    ## AWS boto3 python API credentials file will be used: ~/.aws/credentials.
+    ## Default section is 'default', but you can specify whatever name.
+
+The credentials file should contain entries like:
+
+::
+
+    [default]
+        aws_access_key_id = aws-access-key
+        aws_secret_access_key = aws-secret-key
+
+
 Commit those files so that others will be able to use them.
 
 Initialize the repository. This adds a line to ``.git/config`` telling
