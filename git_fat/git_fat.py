@@ -15,6 +15,10 @@ import shutil
 import argparse
 import platform
 import stat
+import boto3
+import botocore
+import threading
+
 
 _logging.basicConfig(format='%(levelname)s:%(filename)s: %(message)s')
 logger = _logging.getLogger(__name__)
@@ -437,10 +441,223 @@ class RSyncBackend(BackendInterface):
         return True
 
 
+class AWS_S3Backend(BackendInterface):
+
+    AWS_AUTH_FILE = "~/.aws/credentials"
+    AWS_AUTH_FILE_DEFAULT_CONFIG = "default"
+    AWS_ACCESS_KEY = "aws_access_key_id"
+    AWS_ACCESS_SECRET_KEY = "aws_secret_access_key"
+    GITFAT_CONFIG_FILE_REGION_NAME_KEY = "region_name"
+    GITFAT_CONFIG_FILE_BUCKET_KEY = "bucket"
+    GITFAT_CONFIG_AUTH_FILE_KEY = "credentials_file"
+    GITFAT_CONFIG_AUTH_FILE_SECTION_KEY = "credentials_file_section"
+    GITFAT_DOWNLOAD_THREAD_NUM = 8
+
+    class ThreadedTransfer(threading.Thread):
+
+        def __init__(self, aws_client, bucket, file_path, direction="up"):
+            super(AWS_S3Backend.ThreadedTransfer, self).__init__()
+            self.client = aws_client
+            self.bucket = bucket
+            self.file_name = os.path.basename(file_path)
+            self.file_path = file_path
+            self.direction = direction
+            self.success = True
+            self.err_msg = None
+
+        def download(self):
+            with open(self.file_path, "wb") as self.downloaded_file_fd:
+                try:
+                    self.client.download_fileobj(self.bucket, "gitfat-%s" % self.file_name, self.downloaded_file_fd)
+                    os.chmod(self.file_path, int('444', 8) & ~umask())
+                except botocore.exceptions.ClientError, e:
+                    if os.path.exists(self.file_path) and os.path.getsize(self.file_path) == 0:
+                        os.unlink(self.file_path)
+                    self.success = False
+                    self.err_msg = "Warning: Could not download file %s from remote\nWarning: Remote response: %s" % (self.file_name, str(e))
+
+        def upload(self):
+            with open(self.file_path, "r") as file_content_fd:
+                self.client.upload_fileobj(file_content_fd, self.bucket, "gitfat-%s" % self.file_name)
+
+        def run(self):
+            if self.direction == "up":
+                self.upload()
+            elif self.direction == "down":
+                self.download()
+            else:
+                self.success = False
+                self.err_msg = "Programming error"
+
+    def get_region_name(self, kwargs):
+        region_name = self.kwargs.get(AWS_S3Backend.GITFAT_CONFIG_FILE_REGION_NAME_KEY, None)
+        if region_name is None:
+            raise RuntimeError("Your .gitfat [%s] config does not contain any '%s' key." % \
+                               (AWS_S3Backend.BACKEND_KEY, AWS_S3Backend.GITFAT_CONFIG_FILE_REGION_NAME_KEY))
+        if len(region_name) == 0:
+            raise RuntimeError("Your .gitfat [%s] config does not contain any value for the '%s' key: '%s'" % \
+                               (AWS_S3Backend.BACKEND_KEY, AWS_S3Backend.GITFAT_CONFIG_FILE_REGION_NAME_KEY, region_name))
+        return region_name
+
+    def get_transfer_threads_number(self, kwargs):
+        try:
+            transfer_num_threads = int(self.kwargs.get("transfer_num_threads", AWS_S3Backend.GITFAT_DOWNLOAD_THREAD_NUM))
+            if transfer_num_threads <= 0:
+                raise ValueError("The transfer_num_threads value must be a positive integer")
+            return transfer_num_threads
+        except ValueError, e:
+            raise RuntimeError("transfer_num_threads: Bad value: %s" % str(e))
+
+    def get_valid_s3_bucket_name(self, kwargs):
+        bucket_name = kwargs.get(AWS_S3Backend.GITFAT_CONFIG_FILE_BUCKET_KEY, None)
+        if bucket_name is None:
+            raise RuntimeError("Your .gitfat [%s] config does not contain any '%s' key." % \
+                               (AWS_S3Backend.BACKEND_KEY, AWS_S3Backend.GITFAT_CONFIG_FILE_BUCKET_KEY))
+        if len(bucket_name) == 0:
+            raise RuntimeError("Your .gitfat [%s] config does not contain any value for '%s' key." % \
+                               (AWS_S3Backend.BACKEND_KEY, AWS_S3Backend.GITFAT_CONFIG_FILE_BUCKET_KEY))
+        try:
+            if not (bucket_name in [bucket.name for bucket in  self.aws_s3_resource.buckets.all()]):
+                raise RuntimeError("Your .gitfat [%s] specified bucket does not exist in AWS S3" % AWS_S3Backend.BACKEND_KEY)
+        except botocore.exceptions.EndpointConnectionError, e:
+            raise RuntimeError("Your .gitfat config contains an invalid region_name key value: %s" % str(e))
+        except botocore.exceptions.ClientError, e:
+            if "InvalidAccessKeyId" in str(e):
+                raise RuntimeError("You seem not to have an valid AWS S3 access key setup: %s" % str(e))
+            if "SignatureDoesNotMatch" in str(e):
+                raise RuntimeError("You seem not to have a valid AWS S3 secret key setup: %s" % str(e))
+            if "RequestTimeTooSkewed" in str(e):
+                raise RuntimeError("Your system may not have proper date or time setup: %s" % str(e))
+        return bucket_name
+
+    def __init__(self, base_dir, **kwargs):
+        self.base_dir = base_dir
+        self.kwargs = kwargs
+        self.region_name = self.get_region_name(kwargs)
+        self.transfer_num_threads = self.get_transfer_threads_number(kwargs)
+        self.access_key, self.access_secret = self.get_credentials(kwargs)
+        self.aws_s3_session = boto3.Session(
+            aws_access_key_id=self.access_key,
+            aws_secret_access_key=self.access_secret,
+            region_name=self.region_name)
+        self.aws_s3_resource = self.aws_s3_session.resource("s3")
+        self.aws_s3_client = self.aws_s3_resource.meta.client
+        self.bucket_name = self.get_valid_s3_bucket_name(kwargs)
+
+    @property
+    def has_credentials_file(self):
+        return AWS_S3Backend.GITFAT_CONFIG_AUTH_FILE_KEY in self.kwargs
+
+    @property
+    def has_direct_credentials(self):
+        return (AWS_S3Backend.AWS_ACCESS_KEY in self.kwargs and
+                AWS_S3Backend.AWS_ACCESS_SECRET_KEY in self.kwargs)
+
+    def get_credentials(self, kwargs):
+        try:
+            if self.has_credentials_file:
+                return self.read_credentials_from_file(
+                           self.kwargs.get(AWS_S3Backend.GITFAT_CONFIG_AUTH_FILE_KEY),
+                           self.kwargs.get(AWS_S3Backend.GITFAT_CONFIG_AUTH_FILE_SECTION_KEY, AWS_S3Backend.AWS_AUTH_FILE_DEFAULT_CONFIG))
+            elif self.has_direct_credentials:
+                return self.kwargs[AWS_S3Backend.AWS_ACCESS_KEY], self.kwargs[AWS_S3Backend.AWS_ACCESS_SECRET_KEY]
+            else:
+                return self.read_credentials_from_file(
+                    os.path.expanduser(AWS_S3Backend.AWS_AUTH_FILE),
+                    AWS_S3Backend.AWS_AUTH_FILE_DEFAULT_CONFIG)
+        except RuntimeError, e:
+            raise RuntimeError("Credentials improperly configured (%s)" % str(e))
+
+    def read_credentials_from_file(self, file_path, section):
+        if not os.path.exists(file_path):
+            raise RuntimeError("AWS authentication file '%s' not found" % file_path)
+        parser = cfgparser.SafeConfigParser()
+        parser.read(file_path)
+        try:
+            return parser.get(section, AWS_S3Backend.AWS_ACCESS_KEY), parser.get(section, AWS_S3Backend.AWS_ACCESS_SECRET_KEY)
+        except cfgparser.NoSectionError:
+            raise RuntimeError("AWS authentication file '%s' does not have section '%s'" % (file_path, section))
+        except cfgparser.NoOptionError:
+            raise RuntimeError("AWS authentication file section '%s' does not have proper keys setup (%s, and %s)" % \
+                               (file_path, AWS_S3Backend.AWS_ACCESS_KEY, AWS_S3Backend.AWS_ACCESS_SECRET_KEY), section)
+
+    def generic_transfer(self, file_list, direction="up"):
+        def get_transfer_direction_str(direction):
+            if direction == "up":
+                return "upload"
+            elif direction == "down":
+                return "download"
+            else:
+                raise Exception("Programming Error")
+        num_slots_avail = self.transfer_num_threads
+        next_file_idx_to_download = 0
+        threads = {}
+        processed_file = 1
+        num_files = len(file_list)
+        while True:
+            if num_slots_avail and next_file_idx_to_download < num_files:
+                file_to_download = file_list[next_file_idx_to_download]
+                next_file_idx_to_download += 1
+                num_slots_avail -= 1
+                downloader = AWS_S3Backend.ThreadedTransfer(
+                                  self.aws_s3_client, self.bucket_name,
+                                  file_to_download, direction=direction)
+                threads[id(downloader)] = downloader
+                downloader.start()
+            else:
+                if next_file_idx_to_download >= num_files and len(threads) == 0:
+                    break
+                for thread in threads.values():
+                    if thread.is_alive():
+                        continue
+                    else:
+                        if thread.success:
+                            file_size = os.path.getsize(thread.file_path)
+                            if file_size < 1024:
+                                file_size_human_readable = "%dB" % file_size
+                            else:
+                                file_size_human_readable = "%d.%dKB" % (file_size/1024, file_size%1024)
+                            print("%sed %d/%d %s ... %s" % (get_transfer_direction_str(direction).title(),
+                                    processed_file, num_files, thread.file_name, file_size_human_readable))
+                        else:
+                            print(thread.err_msg)
+                        processed_file += 1
+                        thread = threads[id(thread)]
+                        del threads[id(thread)]
+                        del thread
+                        num_slots_avail += 1
+
+    def push_files(self, file_list):
+        def retrieve_s3_stored_objects_ids(self):
+            print("Retrieving remote file list ...")
+            bucket = self.aws_s3_resource.Bucket(self.bucket_name)
+            return [obj.key.split('-')[1] for obj in bucket.objects.filter(Prefix="gitfat-")]
+        files_to_upload = [ os.path.join(self.base_dir, file_path)
+                           for file_path in list(set(file_list)-set(retrieve_s3_stored_objects_ids(self)))]
+        num_files = len(files_to_upload)
+        if num_files == 0:
+            print("No files to upload ...")
+            return False
+        print("Uploading %d files ..." % num_files)
+        self.generic_transfer(files_to_upload, "up")
+        return True
+
+    def pull_files(self, file_list):
+        file_list = [os.path.join(self.base_dir, file_name) for file_name in list(file_list)]
+        num_files = len(file_list)
+        if num_files == 0:
+            print("No files to download ...")
+            return False
+        print("Downloading %d files ..." % num_files)
+        self.generic_transfer(file_list, "down")
+        return True
+
+
 BACKEND_MAP = {
     'rsync': RSyncBackend,
     'http': HTTPBackend,
     'copy': CopyBackend,
+    'aws-s3': AWS_S3Backend
 }
 
 
