@@ -1128,7 +1128,7 @@ def main():
         help='prevent adding excluded to .gitattributes', action='store_false')
     sp.set_defaults(func='index_filter')
 
-    if len(sys.argv) > 1 and sys.argv[1] in [c + 'version' for c in '', '-', '--']:
+    if len(sys.argv) > 1 and sys.argv[1] in [c + 'version' for c in ('', '-', '--')]:
         print(__version__)
         sys.exit(0)
 
